@@ -10,17 +10,199 @@ import tempfile
 import json
 import re
 import subprocess
+import ctypes
+import ctypes.wintypes as wintypes
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+from datetime import datetime
 
-VERSION = "v1.0-patch1"
+VERSION = "v1.1-patch1"
 CREATOR = "liversoda.wx on discord"
 GITHUB_SELF = "https://api.github.com/repos/ServalSoftworks/moeloader/releases/latest"
 BEPINEX_API = "https://api.github.com/repos/BepInEx/BepInEx/releases/latest"
 
-# Preferred BepInEx package
 DEFAULT_BEPINEX_ASSET = "BepInEx_win_x64"
+
+# ---------- Windows API helpers for jimmy ----------
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+psapi = ctypes.WinDLL("psapi", use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_VM_READ = 0x0010
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+def get_process_info(pid: int):
+    """Collect detailed process information for debugging."""
+    info = {"pid": pid}
+
+    # Open process
+    h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not h_process:
+        # Try limited access
+        h_process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h_process:
+            err = ctypes.get_last_error()
+            return {"error": f"Failed to open process (error {err}). Try running as Administrator."}
+
+    try:
+        # Executable path
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if kernel32.QueryFullProcessImageNameW(h_process, 0, buf, ctypes.byref(size)):
+            info["executable"] = buf.value
+        else:
+            info["executable"] = "<unavailable>"
+
+        # Architecture
+        is_wow64 = wintypes.BOOL()
+        if kernel32.IsWow64Process(h_process, ctypes.byref(is_wow64)):
+            info["architecture"] = "32-bit (WOW64)" if is_wow64.value else "64-bit"
+        else:
+            info["architecture"] = "unknown"
+
+        # Memory info
+        mem = PROCESS_MEMORY_COUNTERS()
+        mem.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        if psapi.GetProcessMemoryInfo(h_process, ctypes.byref(mem), mem.cb):
+            info["working_set_mb"] = round(mem.WorkingSetSize / (1024 * 1024), 2)
+            info["peak_working_set_mb"] = round(mem.PeakWorkingSetSize / (1024 * 1024), 2)
+            info["pagefile_mb"] = round(mem.PagefileUsage / (1024 * 1024), 2)
+        else:
+            info["memory"] = "<unavailable>"
+
+        # Process times (creation time)
+        creation = wintypes.FILETIME()
+        exit_t = wintypes.FILETIME()
+        kernel_t = wintypes.FILETIME()
+        user_t = wintypes.FILETIME()
+        if kernel32.GetProcessTimes(h_process, ctypes.byref(creation), ctypes.byref(exit_t),
+                                    ctypes.byref(kernel_t), ctypes.byref(user_t)):
+            # Convert FILETIME to datetime
+            timestamp = ((creation.dwHighDateTime << 32) + creation.dwLowDateTime) / 10_000_000 - 11644473600
+            info["start_time"] = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            info["start_time"] = "<unavailable>"
+
+    finally:
+        kernel32.CloseHandle(h_process)
+
+    # Extra info via PowerShell / tasklist (more reliable for name, cmdline, parent, etc.)
+    try:
+        # Process name + parent + memory via tasklist
+        cmd = f'tasklist /fi "PID eq {pid}" /fo csv /nh /v'
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            # CSV: Image Name, PID, Session Name, Session#, Mem Usage, Status, User Name, CPU Time, Window Title
+            parts = [p.strip('"') for p in result.stdout.strip().split('","')]
+            if len(parts) >= 2:
+                info["name"] = parts[0]
+                if len(parts) >= 5:
+                    info["memory_tasklist"] = parts[4]
+                if len(parts) >= 7:
+                    info["user"] = parts[6]
+                if len(parts) >= 9:
+                    info["window_title"] = parts[8]
+    except Exception:
+        pass
+
+    # Command line via PowerShell (best source)
+    try:
+        ps = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            info["command_line"] = result.stdout.strip()
+    except Exception:
+        info["command_line"] = "<unavailable>"
+
+    # Parent PID
+    try:
+        ps = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").ParentProcessId'
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            info["parent_pid"] = int(result.stdout.strip())
+    except Exception:
+        pass
+
+    # Loaded modules (DLLs)
+    try:
+        h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+        if h_process:
+            modules = (wintypes.HMODULE * 1024)()
+            needed = wintypes.DWORD()
+            if psapi.EnumProcessModules(h_process, modules, ctypes.sizeof(modules), ctypes.byref(needed)):
+                count = needed.value / ctypes.sizeof(wintypes.HMODULE)
+                module_list = []
+                for i in range(min(count, 50)):  # limit to first 50
+                    mod_name = ctypes.create_unicode_buffer(260)
+                    if psapi.GetModuleFileNameExW(h_process, modules[i], mod_name, 260):
+                        module_list.append(mod_name.value)
+                info["modules"] = module_list
+                info["module_count"] = count
+            kernel32.CloseHandle(h_process)
+    except Exception:
+        info["modules"] = "<unavailable>"
+
+    return info
+
+def cmd_jimmy(pid_str: str):
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        print("[!] Invalid process ID. Usage: jimmy <process_id>")
+        return
+
+    print(f"[*] Attaching to process {pid}...")
+    info = get_process_info(pid)
+
+    if "error" in info:
+        print(f"[!] {info['error']}")
+        return
+
+    print("\n========== Process Debug Info ==========")
+    print(f"PID            : {info.get('pid')}")
+    print(f"Name           : {info.get('name', '<unknown>')}")
+    print(f"Parent PID     : {info.get('parent_pid', '<unknown>')}")
+    print(f"Executable     : {info.get('executable', '<unknown>')}")
+    print(f"Architecture   : {info.get('architecture', '<unknown>')}")
+    print(f"Start Time     : {info.get('start_time', '<unknown>')}")
+    print(f"User           : {info.get('user', '<unknown>')}")
+    print(f"Window Title   : {info.get('window_title', '<none>')}")
+    print(f"Working Set    : {info.get('working_set_mb', '?')} MB")
+    print(f"Peak Working   : {info.get('peak_working_set_mb', '?')} MB")
+    print(f"Pagefile       : {info.get('pagefile_mb', '?')} MB")
+    print(f"Command Line   : {info.get('command_line', '<unavailable>')}")
+    print(f"Module Count   : {info.get('module_count', '?')}")
+
+    modules = info.get("modules")
+    if isinstance(modules, list) and modules:
+        print("\n--- Loaded Modules (first 50) ---")
+        for m in modules:
+            print(f"  {m}")
+    print("========================================\n")
+
+# ---------- Original commands ----------
 
 def print_banner():
     print("=" * 50)
@@ -37,6 +219,7 @@ Available commands:
                                   (folder must contain UnityPlayer.dll and an .exe)
   put <bepinex_folder>          - Check BepInEx version and update if newer is available
   um                            - Check for a new version of Moeloader and update itself
+  jimmy <process_id>            - Attach to a process and dump debug info
   exit / quit                   - Exit the program
 """)
 
@@ -198,7 +381,6 @@ def cmd_um():
         print("[+] You are already on the latest version.")
         return
 
-    # Find the .exe asset
     asset_url = None
     for a in data.get("assets", []):
         if a["name"].lower().endswith(".exe"):
@@ -211,7 +393,6 @@ def cmd_um():
 
     print(f"[*] Newer version available ({remote_tag}). Downloading...")
 
-    # Current running executable (works for both .py and frozen .exe)
     current_exe = Path(sys.executable).resolve()
     new_exe = current_exe.with_name(current_exe.stem + "_new.exe")
 
@@ -224,7 +405,6 @@ def cmd_um():
         print(f"[!] Download failed: {e}")
         return
 
-    # Create helper batch file next to the EXE
     bat = current_exe.with_name("moeloader_update.bat")
     bat_content = f"""@echo off
 echo Updating Moeloader...
@@ -244,7 +424,6 @@ del "%~f0"
     print(f"[+] Update helper created: {bat}")
     print("[*] Closing now so the update can finish...")
 
-    # Launch the batch and exit immediately
     subprocess.Popen(
         ["cmd", "/c", str(bat)],
         creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS,
@@ -289,6 +468,11 @@ def main():
                 cmd_put(arg)
         elif cmd == "um":
             cmd_um()
+        elif cmd == "jimmy":
+            if not arg:
+                print("[!] Usage: jimmy <process_id>")
+            else:
+                cmd_jimmy(arg)
         else:
             print(f"[!] Unknown command: {cmd}. Type 'help' for list.")
 
