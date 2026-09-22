@@ -17,7 +17,7 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from datetime import datetime
 
-VERSION = "v1.1-patch1"
+VERSION = "v1.2-patch1"
 CREATOR = "liversoda.wx on discord"
 GITHUB_SELF = "https://api.github.com/repos/ServalSoftworks/moeloader/releases/latest"
 BEPINEX_API = "https://api.github.com/repos/BepInEx/BepInEx/releases/latest"
@@ -27,7 +27,6 @@ DEFAULT_BEPINEX_ASSET = "BepInEx_win_x64"
 # ---------- Windows API helpers for jimmy ----------
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
-advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
@@ -48,20 +47,15 @@ class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
     ]
 
 def get_process_info(pid: int):
-    """Collect detailed process information for debugging."""
     info = {"pid": pid}
-
-    # Open process
     h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not h_process:
-        # Try limited access
         h_process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not h_process:
             err = ctypes.get_last_error()
             return {"error": f"Failed to open process (error {err}). Try running as Administrator."}
 
     try:
-        # Executable path
         buf = ctypes.create_unicode_buffer(1024)
         size = wintypes.DWORD(1024)
         if kernel32.QueryFullProcessImageNameW(h_process, 0, buf, ctypes.byref(size)):
@@ -69,46 +63,34 @@ def get_process_info(pid: int):
         else:
             info["executable"] = "<unavailable>"
 
-        # Architecture
         is_wow64 = wintypes.BOOL()
         if kernel32.IsWow64Process(h_process, ctypes.byref(is_wow64)):
             info["architecture"] = "32-bit (WOW64)" if is_wow64.value else "64-bit"
         else:
             info["architecture"] = "unknown"
 
-        # Memory info
         mem = PROCESS_MEMORY_COUNTERS()
         mem.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
         if psapi.GetProcessMemoryInfo(h_process, ctypes.byref(mem), mem.cb):
             info["working_set_mb"] = round(mem.WorkingSetSize / (1024 * 1024), 2)
             info["peak_working_set_mb"] = round(mem.PeakWorkingSetSize / (1024 * 1024), 2)
             info["pagefile_mb"] = round(mem.PagefileUsage / (1024 * 1024), 2)
-        else:
-            info["memory"] = "<unavailable>"
 
-        # Process times (creation time)
         creation = wintypes.FILETIME()
         exit_t = wintypes.FILETIME()
         kernel_t = wintypes.FILETIME()
         user_t = wintypes.FILETIME()
         if kernel32.GetProcessTimes(h_process, ctypes.byref(creation), ctypes.byref(exit_t),
                                     ctypes.byref(kernel_t), ctypes.byref(user_t)):
-            # Convert FILETIME to datetime
             timestamp = ((creation.dwHighDateTime << 32) + creation.dwLowDateTime) / 10_000_000 - 11644473600
             info["start_time"] = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S UTC")
-        else:
-            info["start_time"] = "<unavailable>"
-
     finally:
         kernel32.CloseHandle(h_process)
 
-    # Extra info via PowerShell / tasklist (more reliable for name, cmdline, parent, etc.)
     try:
-        # Process name + parent + memory via tasklist
         cmd = f'tasklist /fi "PID eq {pid}" /fo csv /nh /v'
         result = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip():
-            # CSV: Image Name, PID, Session Name, Session#, Mem Usage, Status, User Name, CPU Time, Window Title
             parts = [p.strip('"') for p in result.stdout.strip().split('","')]
             if len(parts) >= 2:
                 info["name"] = parts[0]
@@ -121,40 +103,33 @@ def get_process_info(pid: int):
     except Exception:
         pass
 
-    # Command line via PowerShell (best source)
     try:
         ps = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip():
             info["command_line"] = result.stdout.strip()
     except Exception:
         info["command_line"] = "<unavailable>"
 
-    # Parent PID
     try:
         ps = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").ParentProcessId'
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip().isdigit():
             info["parent_pid"] = int(result.stdout.strip())
     except Exception:
         pass
 
-    # Loaded modules (DLLs)
     try:
         h_process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
         if h_process:
             modules = (wintypes.HMODULE * 1024)()
             needed = wintypes.DWORD()
             if psapi.EnumProcessModules(h_process, modules, ctypes.sizeof(modules), ctypes.byref(needed)):
-                count = needed.value / ctypes.sizeof(wintypes.HMODULE)
+                count = needed.value // ctypes.sizeof(wintypes.HMODULE)
                 module_list = []
-                for i in range(min(count, 50)):  # limit to first 50
+                for i in range(min(count, 50)):
                     mod_name = ctypes.create_unicode_buffer(260)
                     if psapi.GetModuleFileNameExW(h_process, modules[i], mod_name, 260):
                         module_list.append(mod_name.value)
@@ -202,6 +177,204 @@ def cmd_jimmy(pid_str: str):
             print(f"  {m}")
     print("========================================\n")
 
+# ---------- New commands ----------
+
+def cmd_cl():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def cmd_attic(directory: str):
+    game_dir = Path(directory).resolve()
+    if not game_dir.is_dir():
+        print(f"[!] Directory does not exist: {game_dir}")
+        return
+
+    if not (game_dir / "UnityPlayer.dll").exists():
+        print("[!] UnityPlayer.dll not found – this does not look like a Unity game.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"{game_dir.name}_backup_{timestamp}"
+    backup_path = game_dir.parent / backup_name
+
+    print(f"[*] Creating backup of: {game_dir}")
+    print(f"[*] Backup location  : {backup_path}")
+
+    try:
+        shutil.copytree(game_dir, backup_path, dirs_exist_ok=False)
+        print(f"[+] Backup completed successfully → {backup_path}")
+    except Exception as e:
+        print(f"[!] Backup failed: {e}")
+
+def get_bepinex_files(game_dir: Path):
+    """Return list of common BepInEx-related files/folders that should be removed on unpatch."""
+    candidates = [
+        game_dir / "BepInEx",
+        game_dir / "BepInEx.disabled",
+        game_dir / "doorstop_config.ini",
+        game_dir / "winhttp.dll",
+        game_dir / "version.dll",
+        game_dir / "changelog.txt",
+        game_dir / ".doorstop_version",
+    ]
+    return [p for p in candidates if p.exists()]
+
+def cmd_unp(args: str):
+    parts = args.split()
+    restore_backup = False
+    path_arg = ""
+
+    if parts and parts[0] == "-b":
+        restore_backup = True
+        path_arg = " ".join(parts[1:]).strip()
+    else:
+        path_arg = args.strip()
+
+    if not path_arg:
+        print("[!] Usage: unp <game_folder>")
+        print("          unp -b <game_folder>   (unpatch + restore from attic backup)")
+        return
+
+    game_dir = Path(path_arg).resolve()
+    if not game_dir.is_dir():
+        print(f"[!] Directory does not exist: {game_dir}")
+        return
+
+    print(f"[*] Unpatching: {game_dir}")
+
+    files = get_bepinex_files(game_dir)
+    if not files:
+        print("[*] No BepInEx files found – nothing to unpatch.")
+    else:
+        for f in files:
+            try:
+                if f.is_dir():
+                    shutil.rmtree(f)
+                    print(f"  [-] Removed folder: {f.name}")
+                else:
+                    f.unlink()
+                    print(f"  [-] Removed file  : {f.name}")
+            except Exception as e:
+                print(f"  [!] Failed to remove {f.name}: {e}")
+        print("[+] Unpatch completed.")
+
+    if restore_backup:
+        # Find the newest attic backup
+        parent = game_dir.parent
+        backups = sorted(
+            [p for p in parent.iterdir() if p.is_dir() and p.name.startswith(f"{game_dir.name}_backup_")],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        if not backups:
+            print("[!] No attic backup found for this game.")
+            return
+
+        latest = backups[0]
+        print(f"[*] Restoring from backup: {latest}")
+
+        # Safety: rename current folder first
+        temp_name = game_dir.with_name(game_dir.name + "_old_unpatched")
+        try:
+            if temp_name.exists():
+                shutil.rmtree(temp_name)
+            game_dir.rename(temp_name)
+            shutil.copytree(latest, game_dir)
+            print(f"[+] Game restored from backup.")
+            print(f"[*] Old unpatched folder kept as: {temp_name}")
+        except Exception as e:
+            print(f"[!] Restore failed: {e}")
+            # try to put original back
+            if temp_name.exists() and not game_dir.exists():
+                temp_name.rename(game_dir)
+
+def cmd_bep(args: str):
+    parts = args.split()
+    if not parts:
+        print("[!] Usage examples:")
+        print("    bep -lp <game_folder>     List plugins")
+        print("    bep -d  <game_folder>     Disable BepInEx")
+        print("    bep -e  <game_folder>     Enable BepInEx")
+        return
+
+    flag = parts[0].lower()
+    path_arg = " ".join(parts[1:]).strip()
+
+    if not path_arg:
+        print("[!] Missing game folder path.")
+        return
+
+    game_dir = Path(path_arg).resolve()
+    if not game_dir.is_dir():
+        print(f"[!] Directory does not exist: {game_dir}")
+        return
+
+    bepinex_dir = game_dir / "BepInEx"
+    disabled_dir = game_dir / "BepInEx.disabled"
+
+    if flag == "-lp":
+        plugins_dir = bepinex_dir / "plugins"
+        if not plugins_dir.is_dir():
+            # also check disabled
+            plugins_dir = disabled_dir / "plugins"
+            if not plugins_dir.is_dir():
+                print("[!] No plugins folder found (BepInEx not installed or empty).")
+                return
+
+        print(f"[*] Plugins in {plugins_dir}:")
+        plugins = list(plugins_dir.rglob("*.dll"))
+        if not plugins:
+            print("  (no plugins found)")
+        else:
+            for p in sorted(plugins):
+                rel = p.relative_to(plugins_dir)
+                print(f"  • {rel}")
+        print(f"\nTotal: {len(plugins)} plugin(s)")
+
+    elif flag == "-d":
+        if not bepinex_dir.exists():
+            print("[!] BepInEx folder not found – nothing to disable.")
+            return
+        if disabled_dir.exists():
+            print("[!] BepInEx.disabled already exists. Remove it first.")
+            return
+
+        try:
+            bepinex_dir.rename(disabled_dir)
+            print("[+] BepInEx disabled (renamed to BepInEx.disabled)")
+
+            # Also rename doorstop dlls so the game doesn't load them
+            for dll_name in ("winhttp.dll", "version.dll"):
+                dll = game_dir / dll_name
+                if dll.exists():
+                    dll.rename(game_dir / (dll_name + ".disabled"))
+                    print(f"  [-] Disabled {dll_name}")
+        except Exception as e:
+            print(f"[!] Failed to disable: {e}")
+
+    elif flag == "-e":
+        if not disabled_dir.exists():
+            print("[!] BepInEx.disabled not found – nothing to enable.")
+            return
+        if bepinex_dir.exists():
+            print("[!] BepInEx folder already exists. Cannot enable.")
+            return
+
+        try:
+            disabled_dir.rename(bepinex_dir)
+            print("[+] BepInEx enabled (renamed back from BepInEx.disabled)")
+
+            for dll_name in ("winhttp.dll", "version.dll"):
+                disabled_dll = game_dir / (dll_name + ".disabled")
+                if disabled_dll.exists():
+                    disabled_dll.rename(game_dir / dll_name)
+                    print(f"  [+] Re-enabled {dll_name}")
+        except Exception as e:
+            print(f"[!] Failed to enable: {e}")
+
+    else:
+        print(f"[!] Unknown flag: {flag}")
+        print("    Supported: -lp  -d  -e")
+
 # ---------- Original commands ----------
 
 def print_banner():
@@ -215,11 +388,17 @@ def cmd_help():
 Available commands:
   help                          - Show this help
   ver                           - Show version and creator
+  cl                            - Clear the screen
   patch <game_directory>        - Install latest BepInEx into a Unity game folder
-                                  (folder must contain UnityPlayer.dll and an .exe)
-  put <bepinex_folder>          - Check BepInEx version and update if newer is available
+  put <bepinex_folder>          - Check BepInEx version and update if needed
   um                            - Check for a new version of Moeloader and update itself
   jimmy <process_id>            - Attach to a process and dump debug info
+  attic <game_folder>           - Create a full backup of the Unity game
+  unp <game_folder>             - Remove BepInEx (unpatch)
+  unp -b <game_folder>          - Unpatch + restore from latest attic backup
+  bep -lp <game_folder>         - List installed BepInEx plugins
+  bep -d  <game_folder>         - Disable BepInEx (without deleting)
+  bep -e  <game_folder>         - Re-enable a disabled BepInEx
   exit / quit                   - Exit the program
 """)
 
@@ -456,6 +635,8 @@ def main():
             cmd_help()
         elif cmd == "ver":
             cmd_ver()
+        elif cmd == "cl":
+            cmd_cl()
         elif cmd == "patch":
             if not arg:
                 print("[!] Usage: patch <directory>")
@@ -473,6 +654,22 @@ def main():
                 print("[!] Usage: jimmy <process_id>")
             else:
                 cmd_jimmy(arg)
+        elif cmd == "attic":
+            if not arg:
+                print("[!] Usage: attic <game_folder>")
+            else:
+                cmd_attic(arg)
+        elif cmd == "unp":
+            if not arg:
+                print("[!] Usage: unp <game_folder>")
+                print("          unp -b <game_folder>")
+            else:
+                cmd_unp(arg)
+        elif cmd == "bep":
+            if not arg:
+                print("[!] Usage: bep -lp|-d|-e <game_folder>")
+            else:
+                cmd_bep(arg)
         else:
             print(f"[!] Unknown command: {cmd}. Type 'help' for list.")
 
